@@ -9,25 +9,23 @@ mod tests;
 use display::{elapsed_time, RawTerminalBackend, Ui};
 use network::{
     dns::{self, IpTable},
-    Connection, LocalSocket, Sniffer, Utilization,
+    LocalSocket, Sniffer, Utilization,
 };
-use os::OnSigWinch;
 
+use ::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ::crossterm::terminal;
 use ::pnet::datalink::{DataLinkReceiver, NetworkInterface};
 use ::std::collections::HashMap;
 use ::std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use ::std::sync::{Arc, Mutex};
 use ::std::thread;
 use ::std::thread::park_timeout;
-use ::termion::event::{Event, Key};
 use ::tui::backend::Backend;
 
 use std::process;
 
-use ::std::io;
 use ::std::time::{Duration, Instant};
-use ::termion::raw::IntoRawMode;
-use ::tui::backend::TermionBackend;
+use ::tui::backend::CrosstermBackend;
 use std::sync::RwLock;
 use structopt::StructOpt;
 
@@ -76,9 +74,6 @@ fn main() {
 }
 
 fn try_main() -> Result<(), failure::Error> {
-    #[cfg(target_os = "windows")]
-    compile_error!("Sorry, no implementations for Windows yet :( - PRs welcome!");
-
     use os::get_input;
     let opts = Opt::from_args();
     let os_input = get_input(&opts.interface, !opts.no_resolve)?;
@@ -87,9 +82,9 @@ fn try_main() -> Result<(), failure::Error> {
         let terminal_backend = RawTerminalBackend {};
         start(terminal_backend, os_input, opts);
     } else {
-        match io::stdout().into_raw_mode() {
-            Ok(stdout) => {
-                let terminal_backend = TermionBackend::new(stdout);
+        match terminal::enable_raw_mode() {
+            Ok(()) => {
+                let terminal_backend = CrosstermBackend::new();
                 start(terminal_backend, os_input, opts);
             }
             Err(_) => failure::bail!(
@@ -102,17 +97,14 @@ fn try_main() -> Result<(), failure::Error> {
 
 pub struct OpenSockets {
     sockets_to_procs: HashMap<LocalSocket, String>,
-    connections: Vec<Connection>,
 }
 
 pub struct OsInputOutput {
     pub network_interfaces: Vec<NetworkInterface>,
     pub network_frames: Vec<Box<dyn DataLinkReceiver>>,
     pub get_open_sockets: fn() -> OpenSockets,
-    pub keyboard_events: Box<dyn Iterator<Item = Event> + Send>,
+    pub terminal_events: Box<dyn Iterator<Item = Event> + Send>,
     pub dns_client: Option<dns::Client>,
-    pub on_winch: Box<OnSigWinch>,
-    pub cleanup: Box<dyn Fn() + Send>,
     pub write_to_stdout: Box<dyn FnMut(String) + Send>,
 }
 
@@ -129,51 +121,15 @@ where
 
     let mut active_threads = vec![];
 
-    let keyboard_events = os_input.keyboard_events;
+    let terminal_events = os_input.terminal_events;
     let get_open_sockets = os_input.get_open_sockets;
     let mut write_to_stdout = os_input.write_to_stdout;
     let mut dns_client = os_input.dns_client;
-    let on_winch = os_input.on_winch;
-    let cleanup = os_input.cleanup;
 
     let raw_mode = opts.raw;
 
     let network_utilization = Arc::new(Mutex::new(Utilization::new()));
     let ui = Arc::new(Mutex::new(Ui::new(terminal_backend, opts.render_opts)));
-
-    if !raw_mode {
-        active_threads.push(
-            thread::Builder::new()
-                .name("resize_handler".to_string())
-                .spawn({
-                    let ui = ui.clone();
-                    let paused = paused.clone();
-                    let cumulative_time = cumulative_time.clone();
-                    let last_start_time = last_start_time.clone();
-                    let ui_offset = ui_offset.clone();
-
-                    move || {
-                        on_winch({
-                            Box::new(move || {
-                                let mut ui = ui.lock().unwrap();
-                                let paused = paused.load(Ordering::SeqCst);
-                                ui.draw(
-                                    paused,
-                                    dns_shown,
-                                    elapsed_time(
-                                        *last_start_time.read().unwrap(),
-                                        *cumulative_time.read().unwrap(),
-                                        paused,
-                                    ),
-                                    ui_offset.load(Ordering::SeqCst),
-                                );
-                            })
-                        });
-                    }
-                })
-                .unwrap(),
-        );
-    }
 
     let display_handler = thread::Builder::new()
         .name("display_handler".to_string())
@@ -191,19 +147,16 @@ where
                 while running.load(Ordering::Acquire) {
                     let render_start_time = Instant::now();
                     let utilization = { network_utilization.lock().unwrap().clone_and_reset() };
-                    let OpenSockets {
-                        sockets_to_procs,
-                        connections,
-                    } = get_open_sockets();
+                    let OpenSockets { sockets_to_procs } = get_open_sockets();
                     let mut ip_to_host = IpTable::new();
                     if let Some(dns_client) = dns_client.as_mut() {
                         ip_to_host = dns_client.cache();
-                        let unresolved_ips = connections
-                            .iter()
+                        let unresolved_ips = utilization
+                            .connections
+                            .keys()
                             .filter(|conn| !ip_to_host.contains_key(&conn.remote_socket.ip))
                             .map(|conn| conn.remote_socket.ip)
                             .collect::<Vec<_>>();
-
                         dns_client.resolve(unresolved_ips);
                     }
                     {
@@ -240,23 +193,51 @@ where
 
     active_threads.push(
         thread::Builder::new()
-            .name("stdin_handler".to_string())
+            .name("terminal_events_handler".to_string())
             .spawn({
                 let running = running.clone();
                 let display_handler = display_handler.thread().clone();
 
                 move || {
-                    for evt in keyboard_events {
+                    for evt in terminal_events {
                         let mut ui = ui.lock().unwrap();
 
                         match evt {
-                            Event::Key(Key::Ctrl('c')) | Event::Key(Key::Char('q')) => {
+                            Event::Resize(_x, _y) => {
+                                if !raw_mode {
+                                    let paused = paused.load(Ordering::SeqCst);
+                                    ui.draw(
+                                        paused,
+                                        dns_shown,
+                                        elapsed_time(
+                                            *last_start_time.read().unwrap(),
+                                            *cumulative_time.read().unwrap(),
+                                            paused,
+                                        ),
+                                        ui_offset.load(Ordering::SeqCst),
+                                    );
+                                };
+                            }
+                            Event::Key(KeyEvent {
+                                modifiers: KeyModifiers::CONTROL,
+                                code: KeyCode::Char('c'),
+                            })
+                            | Event::Key(KeyEvent {
+                                modifiers: KeyModifiers::NONE,
+                                code: KeyCode::Char('q'),
+                            }) => {
                                 running.store(false, Ordering::Release);
-                                cleanup();
                                 display_handler.unpark();
+                                match terminal::disable_raw_mode() {
+                                    Ok(_) => {}
+                                    Err(_) => println!("Error could not disable raw input"),
+                                }
                                 break;
                             }
-                            Event::Key(Key::Char(' ')) => {
+                            Event::Key(KeyEvent {
+                                modifiers: KeyModifiers::NONE,
+                                code: KeyCode::Char(' '),
+                            }) => {
                                 let restarting = paused.fetch_xor(true, Ordering::SeqCst);
                                 if restarting {
                                     *last_start_time.write().unwrap() = Instant::now();
@@ -271,7 +252,10 @@ where
 
                                 display_handler.unpark();
                             }
-                            Event::Key(Key::Char('\t')) => {
+                            Event::Key(KeyEvent {
+                                modifiers: KeyModifiers::NONE,
+                                code: KeyCode::Tab,
+                            }) => {
                                 let paused = paused.load(Ordering::SeqCst);
                                 let elapsed_time = elapsed_time(
                                     *last_start_time.read().unwrap(),

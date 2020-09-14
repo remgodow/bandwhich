@@ -1,11 +1,11 @@
 use ::async_trait::async_trait;
+use ::crossterm::event::Event;
 use ::ipnetwork::IpNetwork;
 use ::pnet::datalink::DataLinkReceiver;
 use ::pnet::datalink::NetworkInterface;
 use ::std::collections::HashMap;
 use ::std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use ::std::{thread, time};
-use ::termion::event::Event;
 use ::tokio::runtime::Runtime;
 
 use crate::{
@@ -13,21 +13,20 @@ use crate::{
         dns::{self, Lookup},
         Connection, Protocol,
     },
-    os::OnSigWinch,
     OpenSockets,
 };
 
-pub struct KeyboardEvents {
+pub struct TerminalEvents {
     pub events: Vec<Option<Event>>,
 }
 
-impl KeyboardEvents {
+impl TerminalEvents {
     pub fn new(mut events: Vec<Option<Event>>) -> Self {
         events.reverse(); // this is so that we do not have to shift the array
-        KeyboardEvents { events }
+        TerminalEvents { events }
     }
 }
-impl Iterator for KeyboardEvents {
+impl Iterator for TerminalEvents {
     type Item = Event;
     fn next(&mut self) -> Option<Event> {
         match self.events.pop() {
@@ -141,7 +140,6 @@ pub fn get_open_sockets() -> OpenSockets {
 
     OpenSockets {
         sockets_to_procs: local_socket_to_procs,
-        connections,
     }
 }
 
@@ -156,15 +154,6 @@ pub fn get_interfaces() -> Vec<NetworkInterface> {
         // at offset 14
         flags: 0,
     }]
-}
-
-pub fn create_fake_on_winch(should_send_winch_event: bool) -> Box<OnSigWinch> {
-    Box::new(move |cb| {
-        if should_send_winch_event {
-            thread::sleep(time::Duration::from_millis(900));
-            cb()
-        }
-    })
 }
 
 pub fn create_fake_dns_client(ips_to_hosts: HashMap<IpAddr, String>) -> Option<dns::Client> {
